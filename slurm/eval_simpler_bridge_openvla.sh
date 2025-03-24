@@ -10,6 +10,9 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=40G
 
+source /n/fs/robot-data/miniconda3/etc/profile.d/conda.sh  # Load Conda environment script
+conda activate openpi  # Activate the environment
+
 # better to run jobs for each task
 TASKS=(
     "widowx_carrot_on_plate"
@@ -24,17 +27,12 @@ for TASK in ${TASKS[@]}; do
 
     CUDA_VISIBLE_DEVICES=0 HYDRA_FULL_ERROR=1 python \
         scripts/run.py \
-        --config-name=bridge \
+        --config-name=bridge_openvla \
         --config-path=../config/eval \
         device=cuda:0 \
         seed=42 \
         n_eval_episode=$N_EVAL_EPISODE \
         n_video=$N_EVAL_EPISODE \
         env.task=$TASK \
-        horizon_steps=4 \
-        act_steps=4 \
-        use_bf16=False \
-        use_torch_compile=True \
-        name=bridge_beta \
-        'checkpoint_path="open-pi-zero/bridge_uniform_step19296_2024-12-26_22-31_42.pt"'
+        pretrained_checkpoint="openvla-7b"
 done

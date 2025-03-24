@@ -3,9 +3,30 @@ Main eval agent. Only for Simpler for now.
 
 """
 
+"""
+run_libero_eval.py
+
+Runs a model in a LIBERO simulation environment.
+
+Usage:
+    # OpenVLA:
+    # IMPORTANT: Set `center_crop=True` if model is fine-tuned with augmentations
+    python experiments/robot/libero/run_libero_eval.py \
+        --model_family openvla \
+        --pretrained_checkpoint <pretrained_checkpoint> \
+        --task_suite_name [ libero_spatial | libero_object | libero_goal | libero_10 | libero_90 ] \
+        --center_crop [ True | False ] \
+        --run_id_note <OPTIONAL TAG TO INSERT INTO RUN ID FOR LOGGING> \
+        --use_wandb [ True | False ] \
+        --wandb_project <PROJECT> \
+        --wandb_entity <ENTITY>
+"""
+
 import logging
 import os
+import sys
 
+import cv2
 import hydra
 import imageio
 import numpy as np
@@ -15,7 +36,49 @@ import torch
 from src.model.vla.pizero import PiZeroInference
 from src.utils.monitor import log_allocated_gpu_memory, log_execution_time
 
+# Append current directory so that interpreter can find experiments.robot
+sys.path.append("../..")
+sys.path.append("/n/fs/robot-data/openvla")
+from experiments.robot.openvla_utils import get_processor
+from experiments.robot.robot_utils import (
+    get_action,
+    get_model,
+)
+from simpler_env.utils.env.observation_utils import get_image_from_maniskill2_obs_dict
+
+from src.utils.geometry import euler2axangle
+
 log = logging.getLogger(__name__)
+
+
+def process_action(hw_action):
+    action_scale = 1.0
+    raw_action = {
+        "world_vector": np.array(hw_action[:3]),
+        "rotation_delta": np.array(hw_action[3:6]),
+        "open_gripper": np.array(hw_action[6:7]),  # range [0, 1]; 1 = open; 0 = close
+    }
+    # process raw_action to obtain the action to be sent to the maniskill2 environment
+    action = {}
+    action["world_vector"] = raw_action["world_vector"] * action_scale
+    action_rotation_delta = np.asarray(raw_action["rotation_delta"], dtype=np.float64)
+
+    # Policy outputs roll, pitch, yaw of EE in Space/Base Frame
+    roll, pitch, yaw = action_rotation_delta  #
+    action_rotation_ax, action_rotation_angle = euler2axangle(roll, pitch, yaw)
+    action_rotation_axangle = action_rotation_ax * action_rotation_angle
+    action["rot_axangle"] = action_rotation_axangle * action_scale
+
+    action["gripper"] = (
+        2.0 * (raw_action["open_gripper"] > 0.5) - 1.0
+    )  # binarize gripper action to 1 (open) and -1 (close)
+    action["terminate_episode"] = np.array([0.0])
+
+    action = np.concatenate(
+        [action["world_vector"], action["rot_axangle"], action["gripper"]]
+    )
+
+    return action
 
 
 class EvalAgent:
@@ -29,6 +92,23 @@ class EvalAgent:
         # model
         self.device = torch.device(f"cuda:{cfg.gpu_id}")
         self.dtype = torch.bfloat16 if cfg.get("use_bf16", False) else torch.float32
+        self.load_model(cfg)
+
+        self.cfg = cfg
+
+        if hasattr(cfg, "act_steps"):
+            self.act_steps = (
+                cfg.act_steps
+            )  # e.g., run first two steps of predicted four steps
+
+        # env --- no parallelized
+        self.env = simpler_env.make(cfg.env.task)
+
+        # env specifics
+        if hasattr(cfg.env, "adapter"):
+            self.env_adapter = hydra.utils.instantiate(cfg.env.adapter)
+
+    def load_model(self, cfg):
         self.model = PiZeroInference(cfg, use_ddp=False)
         self.load_checkpoint(cfg.checkpoint_path)
         self.model.freeze_all_weights()
@@ -47,15 +127,6 @@ class EvalAgent:
         self.model.eval()
         log.info(f"Using cuda device: {self.device} dtype: {self.dtype}")
         log_allocated_gpu_memory(log, "loading model")
-        self.act_steps = (
-            cfg.act_steps
-        )  # e.g., run first two steps of predicted four steps
-
-        # env --- no parallelized
-        self.env = simpler_env.make(cfg.env.task)
-
-        # env specifics
-        self.env_adapter = hydra.utils.instantiate(cfg.env.adapter)
 
     def run(self):
         """
@@ -116,6 +187,7 @@ class EvalAgent:
                 "proprios": inputs["proprios"].to(self.dtype),
             }
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            breakpoint()
             # using bf16 shows ~0.001 difference in action inferred when using vs. not using kv cache (infer_action_naive, needs to pass in full causal_mask instead), if starting from the same initial noise. no difference when using float32
             # https://github.com/huggingface/transformers/issues/25420#issuecomment-1775317535
             with torch.inference_mode():
@@ -123,6 +195,7 @@ class EvalAgent:
                 # actions_naive = self.model.infer_action_naive(**inputs_naive)
                 # print(torch.allclose(actions, actions_naive))
             env_actions = self.env_adapter.postprocess(actions[0].float().cpu().numpy())
+            breakpoint()
 
             # environment step
             for env_action in env_actions[: self.act_steps]:
@@ -187,3 +260,162 @@ class EvalAgent:
         }  # remove "_orig_mod." prefix if saved model was compiled
         self.model.load_state_dict(data["model"], strict=True)
         log.info(f"Loaded model from {path}")
+
+
+class EvalAgentOpenVLA(EvalAgent):
+    def __init__(self, cfg):
+        super().__init__(cfg)
+
+    def load_model(self, cfg):
+        assert cfg.pretrained_checkpoint is not None, (
+            "cfg.pretrained_checkpoint must not be None!"
+        )
+        if "image_aug" in cfg.pretrained_checkpoint:
+            assert cfg.center_crop, (
+                "Expecting `center_crop==True` because model was trained with image augmentations!"
+            )
+        assert not (cfg.load_in_8bit and cfg.load_in_4bit), (
+            "Cannot use both 8-bit and 4-bit quantization!"
+        )
+
+        # Load model
+        model = get_model(cfg)
+
+        # [OpenVLA] Check that the model contains the action un-normalization key
+        if cfg.model_family == "openvla":
+            # In some cases, the key must be manually modified (e.g. after training on a modified version of the dataset
+            # with the suffix "_no_noops" in the dataset name)
+            if (
+                cfg.unnorm_key not in model.norm_stats
+                and f"{cfg.unnorm_key}_no_noops" in model.norm_stats
+            ):
+                cfg.unnorm_key = f"{cfg.unnorm_key}_no_noops"
+            assert cfg.unnorm_key in model.norm_stats, (
+                f"Action un-norm key {cfg.unnorm_key} not found in VLA `norm_stats`!"
+            )
+
+        # [OpenVLA] Get Hugging Face processor
+        self.processor = None
+        if cfg.model_family == "openvla":
+            self.processor = get_processor(cfg)
+
+        # Get expected image dimensions
+        self.resize_size = (224, 224)
+        self.model = model
+
+    def run(self):
+        """
+        Roughly following simpler_env/simple_inference_visual_matching_prepackaged_envs.py
+
+        Assume no obs history for now
+        """
+        env = self.env
+        # env_adapter = self.env_adapter
+        cnt_episode = 0
+        successes = []
+
+        # run episodes --- not dealing with subtasks
+        env_reset_options = {}
+        env_reset_options["obj_init_options"] = {
+            "episode_id": cnt_episode,  # this determines the obj inits in bridge
+        }
+        obs, reset_info = env.reset(options=env_reset_options)
+        # env_adapter.reset()
+        # obs keys: 'agent', 'extra', 'camera_param', 'image'
+        # agent: 'qpos', 'qvel', 'eef_pos', 'controller', 'base_pose'
+        instruction = env.get_language_instruction()
+        recording = self.n_video > 0
+        if recording:
+            os.environ["TOKENIZERS_PARALLELISM"] = (
+                "false"  # avoid tokenizer forking warning about deadlock
+            )
+
+            def video_parent_path(x):
+                return os.path.join(self.video_dir, f"video_{x}")
+
+            video_writer = imageio.get_writer(video_parent_path(cnt_episode) + ".mp4")
+        # is_final_subtask = env.is_final_subtask()
+        log.info(
+            f"Reset info: {reset_info} Instruction: {instruction} Max episode length: {env.spec.max_episode_steps}"
+        )
+        # Bridge: {'scene_name': 'bridge_table_1_v1', 'scene_offset': None, 'scene_pose': None, 'scene_table_height': 0.87, 'urdf_version': '', 'rgb_overlay_path': '.../SimplerEnv/ManiSkill2_real2sim/data/real_inpainting/bridge_real_eval_1.png', 'rgb_overlay_cameras': ['3rd_view_camera'], 'rgb_overlay_mode': 'background', 'disable_bad_material': False, 'episode_model_ids': ['bridge_carrot_generated_modified', 'bridge_plate_objaverse_larger'], 'episode_model_scales': [1.0, 1.0], 'episode_source_obj_name': 'bridge_carrot_generated_modified', 'episode_target_obj_name': 'bridge_plate_objaverse_larger', 'episode_source_obj_init_pose_wrt_robot_base': Pose([0.381995, 0.104536, 0.0175282], [-0.706719, 0.0305475, -0.0305745, -0.706173]), 'episode_target_obj_init_pose_wrt_robot_base': Pose([0.232, -0.047, -0.000468373], [2.00041e-10, -5.10387e-07, -1.6915e-06, -1]), 'episode_id': 5}
+        # Fractal: {'scene_name': 'google_pick_coke_can_1_v4', 'scene_offset': None, 'scene_pose': None, 'scene_table_height': 0.87, 'urdf_version': 'recolor_tabletop_visual_matching_1', 'rgb_overlay_path': '.../SimplerEnv/ManiSkill2_real2sim/data/real_inpainting/google_coke_can_real_eval_1.png', 'rgb_overlay_cameras': ['overhead_camera'], 'rgb_overlay_mode': 'background', 'disable_bad_material': False, 'model_id': 'opened_coke_can', 'model_scale': 1.0, 'distractor_model_ids': None, 'distractor_model_scales': None, 'obj_init_pose_wrt_robot_base': Pose([0.587925, -0.0238302, 0.840576], [0.707052, -0.0081018, -0.01162, -0.70702]), 'orientation': 'laid_vertically'} Instruction: pick coke can Max episode length: 80
+        while 1:
+            # Get preprocessed image
+            img = obs["image"]["3rd_view_camera"]["rgb"]  # (128, 128, 3)
+            print(img.shape)
+            # reshape to (224, 224, 3)
+            img = cv2.resize(img, (224, 224), interpolation=cv2.INTER_AREA)
+
+            # Prepare observations dict
+            # Note: OpenVLA does not take proprio state as input
+            obs = {"full_image": img}
+
+            # using bf16 shows ~0.001 difference in action inferred when using vs. not using kv cache (infer_action_naive, needs to pass in full causal_mask instead), if starting from the same initial noise. no difference when using float32
+            # https://github.com/huggingface/transformers/issues/25420#issuecomment-1775317535
+            with torch.inference_mode():
+                action = get_action(
+                    self.cfg,
+                    self.model,
+                    obs,
+                    instruction,
+                    processor=self.processor,
+                )
+                action = process_action(action)
+
+            env_action = action
+
+            # environment step
+            # for env_action in env_actions:
+            print(env_action.shape)
+            obs, reward, success, truncated, info = env.step(env_action)
+            # if truncated:
+            #     break
+
+            # video
+            if recording:
+                video_writer.append_data(get_image_from_maniskill2_obs_dict(env, obs))
+
+            # update instruction, e.g., pick apple ---> put in top drawer
+            new_instruction = env.get_language_instruction()
+            if new_instruction != instruction:
+                instruction = new_instruction
+
+            # original octo eval only done when timeout, i.e., not upon success
+            if truncated or success:
+                successes.append(success)
+                if recording:
+                    video_writer.close()
+                    if success:  # rename video with success
+                        os.rename(
+                            video_parent_path(cnt_episode) + ".mp4",
+                            video_parent_path(cnt_episode) + "_success.mp4",
+                        )
+                cnt_episode += 1
+
+                # quit
+                if cnt_episode >= self.n_eval_episode:
+                    break
+
+                # reset
+                env_reset_options["obj_init_options"] = {
+                    "episode_id": cnt_episode,
+                }
+                obs, reset_info = env.reset(options=env_reset_options)
+                # env_adapter.reset()
+                instruction = env.get_language_instruction()
+                log.info(
+                    f"Reset info: {reset_info} Instruction: {instruction} Max episode length: {env.spec.max_episode_steps}"
+                )
+                recording = self.n_video > cnt_episode
+                if recording:
+                    video_writer = imageio.get_writer(
+                        video_parent_path(cnt_episode) + ".mp4"
+                    )
+
+        # summary
+        success_rate = np.mean(successes)
+        log.info("============ Evaluation Summary ============")
+        log.info(f"Number of episodes: {cnt_episode}")
+        log.info(f"Success rate: {success_rate}")
+        log.info("============================================")

@@ -1,0 +1,6 @@
+- device=cuda:0
+- seed=42
+- n_eval_episode=240
+- n_video=240
+- env.task=widowx_put_eggplant_in_basket
+- pretrained_checkpoint=openvla-7b
