@@ -21,18 +21,18 @@ TASKS=(
     "widowx_stack_cube"
 )
 
-N_EVAL_EPISODE=240   # octo simpler runs 3 seeds with 24 configs each, here we run 10 seeds
+N_EVAL_EPISODE=60   # octo simpler runs 3 seeds with 24 configs each, here we run 10 seeds
 
 for TASK in ${TASKS[@]}; do
 
     CUDA_VISIBLE_DEVICES=0 HYDRA_FULL_ERROR=1 python \
         scripts/run.py \
-        --config-name=bridge_openvla \
+        --config-name=bridge_ecot \
         --config-path=../config/eval \
         device=cuda:0 \
         seed=42 \
         n_eval_episode=$N_EVAL_EPISODE \
-        n_video=$N_EVAL_EPISODE \
+        n_video=0 \
         env.task=$TASK \
-        pretrained_checkpoint="openvla-7b"
+        pretrained_checkpoint="ecot-openvla-7b-bridge"
 done

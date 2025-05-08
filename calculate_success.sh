@@ -12,4 +12,4 @@ FOLDER="$1"
 count=$(find "$FOLDER" -type f -name "video_*_success.mp4" | wc -l)
 
 # Print result
-echo "Total count of video_*_success.mp4 files in $FOLDER: $count"
+echo "$count"

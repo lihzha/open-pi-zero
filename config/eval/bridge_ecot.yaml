@@ -1,0 +1,30 @@
+defaults:
+  - _self_
+hydra:
+  run:
+    dir: ${log_dir}
+_target_: src.agent.eval.EvalAgentECoT
+
+log_dir: ${oc.env:VLA_LOG_DIR}/eval_bridge/${name}_${seed}/ecot_${env.task}_${now:%H-%M-%S}
+name: bridge_beta
+device: cuda
+seed: 42
+n_eval_episode: 60     # octo simpler runs 3 seeds with 24 configs each, we will run 10 trials for each config
+n_video:  ${n_eval_episode}
+# sweeps:
+#   urdf_version:
+#     - null
+
+unnorm_key: bridge_orig
+model_family: openvla
+pretrained_checkpoint: null
+load_in_8bit: false
+load_in_4bit: false
+center_crop: true
+hf_token: HF_TOKEN
+
+env:
+  task:
+
+
+
